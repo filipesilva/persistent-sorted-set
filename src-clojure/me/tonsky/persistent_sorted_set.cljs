@@ -13,17 +13,19 @@
 
 ; Leaf:     keys[]     :: array of values
 
-; Node:     pointers[] :: links to children nodes
+; Node:     pointers[] :: links to children nodes, or their storage addresses
 ;           keys[]     :: max value for whole subtree
 ;                         node.keys[i] == max(node.pointers[i].keys)
 ; All arrays are 16..32 elements, inclusive
 
 ; BTSet:    root       :: Node or Leaf
 ;           shift      :: depth - 1
-;           cnt        :: size of a set, integer, rolling
+;           cnt        :: size of a set, integer, rolling, -1 if unknown
 ;           comparator :: comparator used for ordering
 ;           meta       :: clojure meta map
 ;           _hash      :: hash code, same as for clojure collections, on-demand, cached
+;           storage    :: IStorage or nil
+;           address    :: address of stored root, nil if not stored
 
 ; Path: conceptually a vector of indexes from root to leaf value, but encoded in a single number.
 ;       E.g. we have path [7 30 11] representing root.pointers[7].pointers[30].keys[11].
@@ -249,14 +251,29 @@
 
 ;;
 
+(defprotocol IStorage
+  (-store [_ node]
+    "Store node and return its address. Called after all node children are stored.
+     For Leaf, store (.-keys node). For Node, store (.-keys node) and (.-pointers node),
+     which are all addresses at that point.")
+  (-restore [_ address]
+    "Return node stored under address, rebuilt with ->Leaf or ->Node.
+     Set does not keep references to restored nodes, so caching is up to storage."))
+
 (defprotocol INode
   (node-lim-key       [_])
   (node-len           [_])
   (node-merge         [_ next])
   (node-merge-n-split [_ next])
-  (node-lookup        [_ cmp key])
-  (node-conj          [_ cmp key])
-  (node-disj          [_ cmp key root? left right]))
+  (node-lookup        [_ storage cmp key])
+  (node-conj          [_ storage cmp key])
+  (node-disj          [_ storage cmp key root? left right]))
+
+(defn- child [storage node idx]
+  (let [ptr (arrays/aget (.-pointers node) idx)]
+    (if (implements? INode ptr)
+      ptr
+      (-restore storage ptr))))
 
 (defn- rotate [node root? left right]
   (cond
@@ -305,14 +322,14 @@
       (return-array (Node. (arrays/aget ks 0) (arrays/aget ps 0))
                     (Node. (arrays/aget ks 1) (arrays/aget ps 1)))))
 
-  (node-lookup [_ cmp key]
+  (node-lookup [this storage cmp key]
     (let [idx (lookup-range cmp keys key)]
       (when-not (== -1 idx)
-        (node-lookup (arrays/aget pointers idx) cmp key))))
+        (node-lookup (child storage this idx) storage cmp key))))
   
-  (node-conj [_ cmp key]
+  (node-conj [this storage cmp key]
     (let [idx   (binary-search-l cmp keys (- (arrays/alength keys) 2) key)
-          nodes (node-conj (arrays/aget pointers idx) cmp key)]
+          nodes (node-conj (child storage this idx) storage cmp key)]
       (when nodes
         (let [new-keys     (check-n-splice cmp keys     idx (inc idx) (arrays/amap node-lim-key nodes))
               new-pointers (splice             pointers idx (inc idx) nodes)]
@@ -327,19 +344,26 @@
                 (Node. (.slice new-keys     middle)
                        (.slice new-pointers middle)))))))))
 
-  (node-disj [_ cmp key root? left right]
+  (node-disj [this storage cmp key root? left right]
     (let [idx (lookup-range cmp keys key)]
       (when-not (== -1 idx) ;; short-circuit, key not here
-        (let [child       (arrays/aget pointers idx)
+        (let [child-node  (child storage this idx)
               left-child  (when (>= (dec idx) 0)
-                            (arrays/aget pointers (dec idx)))
+                            (child storage this (dec idx)))
               right-child (when (< (inc idx) (arrays/alength pointers))
-                            (arrays/aget pointers (inc idx)))
-              disjned     (node-disj child cmp key false left-child right-child)]
+                            (child storage this (inc idx)))
+              disjned     (node-disj child-node storage cmp key false left-child right-child)]
           (when disjned     ;; short-circuit, key not here
             (let [left-idx     (if left-child  (dec idx) idx)
                   right-idx    (if right-child (+ 2 idx) (+ 1 idx))
                   new-keys     (check-n-splice cmp keys     left-idx right-idx (arrays/amap node-lim-key disjned))
+                  ;; keep addresses of unchanged siblings
+                  disjned      (arrays/amap
+                                 #(cond
+                                    (identical? % left-child)  (arrays/aget pointers (dec idx))
+                                    (identical? % right-child) (arrays/aget pointers (inc idx))
+                                    :else                      %)
+                                 disjned)
                   new-pointers (splice             pointers left-idx right-idx disjned)]
               (rotate (Node. new-keys new-pointers) root? left right))))))))
 
@@ -361,12 +385,12 @@
       (return-array (Leaf. (arrays/aget ks 0))
                     (Leaf. (arrays/aget ks 1)))))
   
-  (node-lookup [_ cmp key]
+  (node-lookup [_ storage cmp key]
     (let [idx (lookup-exact cmp keys key)]
       (when-not (== -1 idx)
         (arrays/aget keys idx))))
 
-  (node-conj [_ cmp key]
+  (node-conj [_ storage cmp key]
     (let [idx    (binary-search-l cmp keys (dec (arrays/alength keys)) key)
           keys-l (arrays/alength keys)]
       (cond
@@ -392,7 +416,7 @@
         :else
           (arrays/array (Leaf. (splice keys idx idx (arrays/array key)))))))
   
-  (node-disj [_ cmp key root? left right]
+  (node-disj [_ storage cmp key root? left right]
     (let [idx (lookup-exact cmp keys key)]
       (when-not (== -1 idx) ;; key is here
         (let [new-keys (splice keys idx (inc idx) (arrays/array))]
@@ -400,31 +424,31 @@
 
 ;; BTSet
 
-(declare conj disj btset-iter)
+(declare conj disj btset-iter count-keys)
 
 (def ^:private ^:const uninitialized-hash nil)
 
-(deftype BTSet [root shift cnt comparator meta ^:mutable _hash]
+(deftype BTSet [root shift ^:mutable cnt comparator meta ^:mutable _hash ^:mutable storage ^:mutable address]
   Object
   (toString [this] (pr-str* this))
 
   ICloneable
-  (-clone [_] (BTSet. root shift cnt comparator meta _hash))
+  (-clone [_] (BTSet. root shift cnt comparator meta _hash storage address))
 
   IWithMeta
-  (-with-meta [_ new-meta] (BTSet. root shift cnt comparator new-meta _hash))
+  (-with-meta [_ new-meta] (BTSet. root shift cnt comparator new-meta _hash storage address))
 
   IMeta
   (-meta [_] meta)
 
   IEmptyableCollection
-  (-empty [_] (BTSet. (Leaf. (arrays/array)) 0 0 comparator meta uninitialized-hash))
+  (-empty [_] (BTSet. (Leaf. (arrays/array)) 0 0 comparator meta uninitialized-hash storage nil))
 
   IEquiv
   (-equiv [this other]
     (and
       (set? other)
-      (== cnt (count other))
+      (== (-count this) (count other))
       (every? #(contains? this %) other)))
 
   IHash
@@ -438,9 +462,9 @@
 
   ILookup 
   (-lookup [_ k]
-    (node-lookup root comparator k))
+    (node-lookup root storage comparator k))
   (-lookup [_ k not-found]
-    (or (node-lookup root comparator k) not-found))
+    (or (node-lookup root storage comparator k) not-found))
 
   ISeqable
   (-seq [this] (btset-iter this))
@@ -466,7 +490,10 @@
   ; (-comparator [this] comparator)
 
   ICounted
-  (-count [_] cnt)
+  (-count [_]
+    (when (neg? cnt)
+      (set! cnt (count-keys storage root shift)))
+    cnt)
 
   IEditableCollection
   (-as-transient [this] this)
@@ -486,26 +513,39 @@
   (-pr-writer [this writer opts]
     (pr-sequential-writer writer pr-writer "#{" " " "}" opts (seq this))))
   
+(defn- count-keys [storage node level]
+  (if (pos? level)
+    (let [len (arrays/alength (.-pointers node))]
+      (loop [i 0 acc 0]
+        (if (< i len)
+          (recur (inc i) (+ acc (count-keys storage (child storage node i) (dec level))))
+          acc)))
+    (arrays/alength (.-keys node))))
+
 (defn- keys-for [set path]
-  (loop [level (.-shift set)
-         node  (.-root set)]
-    (if (pos? level)
-      (recur
-        (dec level)
-        (arrays/aget (.-pointers node) (path-get path level)))
-      (.-keys node))))
+  (let [storage (.-storage set)]
+    (loop [level (.-shift set)
+           node  (.-root set)]
+      (if (pos? level)
+        (recur
+          (dec level)
+          (child storage node (path-get path level)))
+        (.-keys node)))))
+
+(defn- alter-cnt [cnt delta]
+  (if (neg? cnt) cnt (+ cnt delta)))
 
 (defn- alter-btset [set root shift cnt]
-  (BTSet. root shift cnt (.-comparator set) (.-meta set) uninitialized-hash))
+  (BTSet. root shift cnt (.-comparator set) (.-meta set) uninitialized-hash (.-storage set) nil))
 
 
 ;; iteration
 
-(defn- -next-path [node ^number path ^number level]
+(defn- -next-path [storage node ^number path ^number level]
   (let [idx (path-get path level)]
     (if (pos? level)
       ;; inner node
-      (let [sub-path (-next-path (arrays/aget (.-pointers node) idx) path (dec level))]
+      (let [sub-path (-next-path storage (child storage node idx) path (dec level))]
         (if (nil? sub-path)
           ;; nested node overflow
           (if (< (inc idx) (arrays/alength (.-pointers node)))
@@ -524,14 +564,14 @@
 
 (defn- -rpath
   "Returns rightmost path possible starting from node and going deeper"
-  [node ^number path ^number level]
+  [storage node ^number path ^number level]
   (loop [node  node
          path  path
          level level]
     (if (pos? level)
       ;; inner node
       (recur
-        (arrays/alast (.-pointers node))
+        (child storage node (dec (arrays/alength (.-pointers node))))
         (path-set path level (dec (arrays/alength (.-pointers node))))
         (dec level))
       ;; leaf
@@ -544,10 +584,10 @@
   (if (neg? path)
     empty-path
     (or
-      (-next-path (.-root set) path (.-shift set))
-      (path-inc (-rpath (.-root set) empty-path (.-shift set))))))
+      (-next-path (.-storage set) (.-root set) path (.-shift set))
+      (path-inc (-rpath (.-storage set) (.-root set) empty-path (.-shift set))))))
 
-(defn- -prev-path [node ^number path ^number level]
+(defn- -prev-path [storage node ^number path ^number level]
   (let [idx (path-get path level)]
     (cond
       ;; leaf overflow
@@ -560,10 +600,10 @@
       
       ;; branch that was overflow before
       (>= idx (node-len node))
-      (-rpath node path level)
+      (-rpath storage node path level)
 
       :else
-      (let [path' (-prev-path (arrays/aget (.-pointers node) idx) path (dec level))]
+      (let [path' (-prev-path storage (child storage node idx) path (dec level))]
         (cond
           ;; no sub-overflow, keep current idx
           (some? path')
@@ -575,7 +615,7 @@
           
           ;; nested overflow, advance current idx, reset subsequent indexes
           :else
-          (let [path' (-rpath (arrays/aget (.-pointers node) (dec idx)) path (dec level))]
+          (let [path' (-rpath storage (child storage node (dec idx)) path (dec level))]
             (path-set path' level (dec idx))))))))
 
 (defn- prev-path
@@ -583,9 +623,9 @@
    Will overflow at leaf if at beginning of tree"
   [set ^number path]
   (if (> (path-get path (inc (.-shift set))) 0) ;; overflow
-    (-rpath (.-root set) path (.-shift set))
+    (-rpath (.-storage set) (.-root set) path (.-shift set))
     (or
-      (-prev-path (.-root set) path (.-shift set))
+      (-prev-path (.-storage set) (.-root set) path (.-shift set))
       (path-dec empty-path))))
 
 (declare iter riter)
@@ -595,7 +635,7 @@
   [set]
   (when (pos? (node-len (.-root set)))
     (let [left  empty-path
-          rpath (-rpath (.-root set) empty-path (.-shift set))
+          rpath (-rpath (.-storage set) (.-root set) empty-path (.-shift set))
           right (next-path set rpath)]
       (iter set left right))))
 
@@ -830,13 +870,13 @@
 
 ;; distance
 
-(defn- -distance [node left right level]
+(defn- -distance [storage node left right level]
   (let [idx-l (path-get left level)
         idx-r (path-get right level)]
     (if (pos? level)
       ;; inner node
       (if (== idx-l idx-r)
-        (-distance (arrays/aget (.-pointers node) idx-l) left right (dec level))
+        (-distance storage (child storage node idx-l) left right (dec level))
         (loop [level level
                res   (- idx-r idx-l)]
           (if (== 0 level)
@@ -856,7 +896,7 @@
     1
     
     :else
-    (-distance (.-root set) path-l path-r (.-shift set))))
+    (-distance (.-storage set) (.-root set) path-l path-r (.-shift set))))
 
 (defn est-count [iter]
   (distance (.-set iter) (.-left iter) (.-right iter)))
@@ -883,7 +923,7 @@
           (let [keys (.-keys node)
                 idx  (binary-search-l comparator keys (- keys-l 2) key)]
             (recur
-              (arrays/aget (.-pointers node) idx)
+              (child (.-storage set) node idx)
               (path-set path level idx)
               (dec level))))))))
 
@@ -893,7 +933,7 @@
    It’s a virtual path that is bigger than any path in a tree"
   [set key comparator]
   (if (nil? key)
-    (path-inc (-rpath (.-root set) empty-path (.-shift set)))
+    (path-inc (-rpath (.-storage set) (.-root set) empty-path (.-shift set)))
     (loop [node  (.-root set)
            path  empty-path
            level (.-shift set)]
@@ -907,7 +947,7 @@
                 idx  (binary-search-r comparator keys (- keys-l 2) key)
                 res  (path-set path level idx)]
             (recur
-              (arrays/aget (.-pointers node) idx)
+              (child (.-storage set) node idx)
               res
               (dec level))))))))
 
@@ -987,7 +1027,7 @@
 (defn conj
   "Analogue to [[clojure.core/conj]] with comparator that overrides the one stored in set."
   [set key cmp]
-  (let [roots (node-conj (.-root set) cmp key)]
+  (let [roots (node-conj (.-root set) (.-storage set) cmp key)]
     (cond
       ;; tree not changed
       (nil? roots)
@@ -998,20 +1038,20 @@
         (alter-btset set
           (arrays/aget roots 0)
           (.-shift set)
-          (inc (.-cnt set)))
+          (alter-cnt (.-cnt set) 1))
      
       ;; introducing new root
       :else
         (alter-btset set
           (Node. (arrays/amap node-lim-key roots) roots)
           (inc (.-shift set))
-          (inc (.-cnt set))))))
+          (alter-cnt (.-cnt set) 1)))))
 
 
 (defn disj
   "Analogue to [[clojure.core/disj]] with comparator that overrides the one stored in set."
   [set key cmp]
-  (let [new-roots (node-disj (.-root set) cmp key true nil nil)]
+  (let [new-roots (node-disj (.-root set) (.-storage set) cmp key true nil nil)]
     (if (nil? new-roots) ;; nothing changed, key wasn't in the set
       set
       (let [new-root (arrays/aget new-roots 0)]
@@ -1020,15 +1060,15 @@
           
           ;; root has one child, make him new root
           (alter-btset set
-            (arrays/aget (.-pointers new-root) 0)
+            (child (.-storage set) new-root 0)
             (dec (.-shift set))
-            (dec (.-cnt set)))
+            (alter-cnt (.-cnt set) -1))
           
           ;; keeping root level
           (alter-btset set
             new-root
             (.-shift set)
-            (dec (.-cnt set))))))))
+            (alter-cnt (.-cnt set) -1)))))))
 
 
 (defn slice
@@ -1069,15 +1109,16 @@
    (from-sorted-array cmp arr (arrays/alength arr) {}))
   ([cmp arr _len]
    (from-sorted-array cmp arr _len {}))
-  ([cmp arr _len _opts]
-   (let [leaves (->> arr
+  ([cmp arr _len opts]
+   (let [storage (:storage opts)
+         leaves (->> arr
                     (arr-partition-approx min-len max-len)
                     (arr-map-inplace #(Leaf. %)))]
      (loop [current-level leaves
             shift 0]
        (case (count current-level)
-         0 (BTSet. (Leaf. (arrays/array)) 0 0 cmp nil uninitialized-hash)
-         1 (BTSet. (first current-level) shift (arrays/alength arr) cmp nil uninitialized-hash)
+         0 (BTSet. (Leaf. (arrays/array)) 0 0 cmp nil uninitialized-hash storage nil)
+         1 (BTSet. (first current-level) shift (arrays/alength arr) cmp nil uninitialized-hash storage nil)
          (recur
            (->> current-level
              (arr-partition-approx min-len max-len)
@@ -1095,11 +1136,11 @@
 (defn sorted-set*
   "Create a set with custom comparator, metadata and settings"
   [opts]
-  (BTSet. (Leaf. (arrays/array)) 0 0 (or (:cmp opts) compare) (:meta opts) uninitialized-hash))
+  (BTSet. (Leaf. (arrays/array)) 0 0 (or (:cmp opts) compare) (:meta opts) uninitialized-hash (:storage opts) nil))
 
 
 (defn sorted-set-by
-  ([cmp] (BTSet. (Leaf. (arrays/array)) 0 0 cmp nil uninitialized-hash))
+  ([cmp] (BTSet. (Leaf. (arrays/array)) 0 0 cmp nil uninitialized-hash nil nil))
   ([cmp & keys] (from-sequential cmp keys)))
 
 
@@ -1110,3 +1151,65 @@
 (defn settings [set]
   {:branching-factor max-len
    :ref-type :strong})
+
+(defn restore-by
+  "Constructs lazily-loaded set from storage, root address and custom comparator.
+   Supports all operations that normal in-memory impl would,
+   will fetch missing nodes by calling IStorage::-restore when needed"
+  ([cmp address storage]
+   (restore-by cmp address storage {}))
+  ([cmp address storage opts]
+   (let [root  (-restore storage address)
+         shift (loop [node root, shift 0]
+                 (if (instance? Node node)
+                   (recur (child storage node 0) (inc shift))
+                   shift))]
+     (BTSet. root shift -1 cmp (:meta opts) uninitialized-hash storage address))))
+
+(defn restore
+  "Constructs lazily-loaded set from storage and root address.
+   Supports all operations that normal in-memory impl would,
+   will fetch missing nodes by calling IStorage::-restore when needed"
+  ([address storage]
+   (restore-by compare address storage {}))
+  ([address storage opts]
+   (restore-by compare address storage opts)))
+
+(defn- store-node [storage node]
+  (when (instance? Node node)
+    (let [pointers (.-pointers node)]
+      (dotimes [i (arrays/alength pointers)]
+        (let [ptr (arrays/aget pointers i)]
+          (when (implements? INode ptr)
+            (arrays/aset pointers i (store-node storage ptr)))))))
+  (-store storage node))
+
+(defn store
+  "Store each not-yet-stored node by calling IStorage::-store and remembering
+   returned address. Incremental, won’t store same node twice on subsequent calls.
+   Returns root address. Remember it and use it for restore"
+  ([set]
+   (assert (some? (.-storage set)))
+   (when (nil? (.-address set))
+     (set! (.-address set) (store-node (.-storage set) (.-root set))))
+   (.-address set))
+  ([set storage]
+   (set! (.-storage set) storage)
+   (store set)))
+
+(defn walk-addresses
+  "Visit each address used by this set. Usable for cleaning up
+   garbage left in storage from previous versions of the set.
+   Won’t descend into subtree if consume-fn returns falsy"
+  [set consume-fn]
+  (let [storage (.-storage set)
+        walk    (fn walk [node level]
+                  (when (pos? level)
+                    (let [pointers (.-pointers node)]
+                      (dotimes [i (arrays/alength pointers)]
+                        (let [ptr (arrays/aget pointers i)]
+                          (when (or (implements? INode ptr) (consume-fn ptr))
+                            (when (> level 1)
+                              (walk (child storage node i) (dec level)))))))))]
+    (when (or (nil? (.-address set)) (consume-fn (.-address set)))
+      (walk (.-root set) (.-shift set)))))
